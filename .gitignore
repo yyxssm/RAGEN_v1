@@ -19,6 +19,8 @@ tensorflow/my_graph/*
 *.so
 data
 results/
+kernel_meta/
+fusion_result.json
 
 # Distribution / packaging
 .Python
@@ -70,6 +72,7 @@ image_outputs
 
 checkpoints
 model_saving/
+models/
 
 # Flask stuff:
 instance/

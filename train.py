@@ -17,6 +17,103 @@ register_resolvers()
 import sys
 import socket
 
+
+_AUTO_DEVICE_VALUES = {"", "auto", "none", "null"}
+
+
+def _normalize_visible_devices(value):
+    if value is None:
+        return ""
+
+    if isinstance(value, (list, tuple)):
+        raw_devices = value
+    else:
+        text = str(value).strip()
+        while len(text) >= 2 and text[0] == text[-1] and text[0] in ("'", '"'):
+            text = text[1:-1].strip()
+        if text.startswith("[") and text.endswith("]"):
+            text = text[1:-1].strip()
+        raw_devices = text.split(",")
+
+    devices = []
+    for device in raw_devices:
+        device = str(device).strip().strip("'\"")
+        if device:
+            devices.append(device)
+    return ",".join(devices)
+
+
+def _is_auto_value(value):
+    return _normalize_visible_devices(value).lower() in _AUTO_DEVICE_VALUES
+
+
+def _device_env_candidates(device_name):
+    if str(device_name).lower() == "npu":
+        return ("ASCEND_RT_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES")
+    return ("CUDA_VISIBLE_DEVICES", "ASCEND_RT_VISIBLE_DEVICES")
+
+
+def _available_device_count(device_name):
+    try:
+        if str(device_name).lower() == "npu" and hasattr(torch, "npu"):
+            return int(torch.npu.device_count())
+        if str(device_name).lower() == "cuda":
+            return int(torch.cuda.device_count())
+    except Exception:
+        return 0
+    return 0
+
+
+def _count_visible_devices(visible_devices, device_name):
+    visible_devices = _normalize_visible_devices(visible_devices)
+    lowered = visible_devices.lower()
+    if lowered in _AUTO_DEVICE_VALUES:
+        count = _available_device_count(device_name)
+        return count if count > 0 else 1
+    if lowered == "all":
+        count = _available_device_count(device_name)
+        if count <= 0:
+            raise ValueError("Cannot infer n_gpus_per_node from visible devices value 'all'.")
+        return count
+    return len([device for device in visible_devices.split(",") if device])
+
+
+def resolve_device_config(config):
+    device_name = str(getattr(config.trainer, "device", "cuda")).lower()
+    configured_visible_devices = config.system.CUDA_VISIBLE_DEVICES
+    visible_devices = _normalize_visible_devices(configured_visible_devices)
+
+    if _is_auto_value(visible_devices):
+        for env_key in _device_env_candidates(device_name):
+            visible_devices = _normalize_visible_devices(os.environ.get(env_key))
+            if not _is_auto_value(visible_devices):
+                break
+        else:
+            visible_devices = "0"
+
+    n_devices = _count_visible_devices(visible_devices, device_name)
+    if n_devices <= 0:
+        raise ValueError(f"No visible {device_name} devices were configured: {configured_visible_devices}")
+
+    previous_n_devices = getattr(config.trainer, "n_gpus_per_node", None)
+    config.system.CUDA_VISIBLE_DEVICES = visible_devices
+    config.trainer.n_gpus_per_node = n_devices
+
+    os.environ["CUDA_VISIBLE_DEVICES"] = visible_devices
+    if device_name == "npu":
+        os.environ["ASCEND_RT_VISIBLE_DEVICES"] = visible_devices
+
+    if str(previous_n_devices) != str(n_devices):
+        print(
+            f"[INFO] trainer.n_gpus_per_node auto-set to {n_devices} "
+            f"from visible devices '{visible_devices}' (was {previous_n_devices})."
+        )
+    else:
+        print(f"[INFO] trainer.n_gpus_per_node={n_devices} from visible devices '{visible_devices}'.")
+
+    return config
+
+
 class DummyRewardManager():
     """The reward manager.
     """
@@ -127,6 +224,7 @@ def get_custom_reward_fn(config):
 
 
 def add_dependency_and_validate_config(config):
+    config = resolve_device_config(config)
 
     # validate config
     actor_ppo_micro_batch_size = config.actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu
@@ -136,8 +234,9 @@ def add_dependency_and_validate_config(config):
         f"ppo_mini_batch_size ({config.actor_rollout_ref.actor.ppo_mini_batch_size}) must be divisible by actor ppo_micro_batch_size_per_gpu * n_gpus_per_node ({actor_ppo_micro_batch_size * config.trainer.n_gpus_per_node})"
     assert ("qwen" in config.model_path.lower() or "llama-3" in config.model_path.lower()) or (not config.enable_response_mask), \
         "response mask is currently only supported for qwen and llama-3 models"
-    assert len(str(config.system.CUDA_VISIBLE_DEVICES).split(',')) == config.trainer.n_gpus_per_node, \
-        f"CUDA_VISIBLE_DEVICES ({config.system.CUDA_VISIBLE_DEVICES}) must have the same number of GPUs as n_gpus_per_node ({config.trainer.n_gpus_per_node})"
+    visible_device_count = _count_visible_devices(config.system.CUDA_VISIBLE_DEVICES, config.trainer.device)
+    assert visible_device_count == config.trainer.n_gpus_per_node, \
+        f"visible devices ({config.system.CUDA_VISIBLE_DEVICES}) must resolve to the same number of devices as n_gpus_per_node ({config.trainer.n_gpus_per_node})"
     context_window_mode = getattr(config.agent_proxy, "context_window_mode", "full")
     rollout_filter_strategy = getattr(config.actor_rollout_ref.rollout, "rollout_filter_strategy", "top_p")
     rollout_filter_value = getattr(config.actor_rollout_ref.rollout, "rollout_filter_value", 0.25)
@@ -180,7 +279,12 @@ def main(config):
 def run_ppo(config) -> None:
     # TODO(linjunrong.ocss884): this ENV is left for resolving SGLang conflict with ray devices
     # isolation, will solve in the future
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(config.system.CUDA_VISIBLE_DEVICES)
+    visible_devices = _normalize_visible_devices(config.system.CUDA_VISIBLE_DEVICES)
+    device_name = str(getattr(config.trainer, "device", "cuda")).lower()
+    os.environ["CUDA_VISIBLE_DEVICES"] = visible_devices
+    if device_name == "npu":
+        os.environ["ASCEND_RT_VISIBLE_DEVICES"] = visible_devices
+        print(f"ASCEND_RT_VISIBLE_DEVICES: {os.environ['ASCEND_RT_VISIBLE_DEVICES']}")
     print(f"CUDA_VISIBLE_DEVICES: {os.environ['CUDA_VISIBLE_DEVICES']}")
     os.environ["ENSURE_CUDA_VISIBLE_DEVICES"] = os.environ.get('CUDA_VISIBLE_DEVICES', '')
     if not ray.is_initialized():

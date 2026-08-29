@@ -1,7 +1,7 @@
 import pytest
 from ragen.llm_agent.ctx_manager import ContextManager
 from omegaconf import OmegaConf
-from verl.verl.protocol import DataProto
+from verl import DataProto
 
 class DummyTokenizer:
     name_or_path = "qwen"  # or "llama-3" or any string your code expects
@@ -9,11 +9,18 @@ class DummyTokenizer:
     def apply_chat_template(self, messages, add_generation_prompt, tokenize):
         return " ".join([msg["content"] for msg in messages])
 
-    def __call__(self, texts, return_tensors, padding, padding_side, truncation):
+    def __call__(self, texts, *args, **kwargs):
         import torch
+        if isinstance(texts, str):
+            if kwargs.get("add_special_tokens") is False:
+                return {"input_ids": [1, 2, 3]}
+            texts = [texts]
+        batch_size = len(texts)
+
         class DummyOutput:
-            input_ids = torch.tensor([[1, 2, 3]])
-            attention_mask = torch.tensor([[1, 1, 1]])
+            input_ids = torch.tensor([[1, 2, 3]] * batch_size)
+            attention_mask = torch.tensor([[1, 1, 1]] * batch_size)
+
         return DummyOutput()
 
     def encode(self, text):
@@ -24,6 +31,7 @@ class DummyTokenizer:
 def dummy_config():
     cfg = OmegaConf.create({
         "agent_proxy": {
+            "context_window_mode": "limited_multi_turn",
             "max_context_window": 2,
             "enable_think": False,
             "use_turn_scores": False,
@@ -76,7 +84,7 @@ def test_context_window_truncation(dummy_config):
     }]
 
     lm_inputs: DataProto = ctx.get_lm_inputs(env_outputs, prepare_for_update=True)
-    messages = lm_inputs.non_tensor_batch["messages_list"][0]
+    messages = lm_inputs.non_tensor_batch["messages_list"][-1]
 
     # Ensure only last 2 turns are present
     assert "S1" not in str(messages)

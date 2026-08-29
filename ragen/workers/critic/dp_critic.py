@@ -21,12 +21,13 @@ import os
 
 import torch
 import torch.distributed
-from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
+from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from torch import nn, optim
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from verl import DataProto
 from verl.trainer.ppo import core_algos
 from verl.utils.debug import GPUMemoryLogger
+from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
 from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
@@ -60,7 +61,7 @@ class DataParallelPPOCritic(BasePPOCritic):
             for key in micro_batch["multi_modal_inputs"][0].keys():
                 multi_modal_inputs[key] = torch.cat([inputs[key] for inputs in micro_batch["multi_modal_inputs"]], dim=0)
 
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
             input_ids = micro_batch["input_ids"]
             batch, seqlen = input_ids.shape
             attention_mask = micro_batch["attention_mask"]
@@ -225,9 +226,9 @@ class DataParallelPPOCritic(BasePPOCritic):
                 for data in micro_batches:
                     # Support all devices
                     if isinstance(data, DataProto):
-                        data = {**data.batch.to(torch.cuda.current_device()), **data.non_tensor_batch}
+                        data = {**data.batch.to(get_device_id()), **data.non_tensor_batch}
                     else:
-                        data = data.to(torch.cuda.current_device())  # critic device is cpu when using offload
+                        data = data.to(get_device_id())  # critic device is cpu when using offload
                     responses = data["responses"]
                     attention_mask = data["attention_mask"]
                     values = data["values"]

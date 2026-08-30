@@ -950,6 +950,7 @@ class RayAgentTrainer(VerlRayPPOTrainer):
         from omegaconf import OmegaConf
 
         from verl.utils.tracking import Tracking
+        import atexit
 
         logger = Tracking(
             project_name=self.config.trainer.project_name,
@@ -958,9 +959,51 @@ class RayAgentTrainer(VerlRayPPOTrainer):
             config=OmegaConf.to_container(self.config, resolve=True),
         )
 
+        logger_finished = False
+
+        def _finish_backend(backend_name, backend_logger):
+            finish = getattr(backend_logger, "finish", None)
+            if not callable(finish):
+                return
+            if backend_name in ("wandb", "vemlp_wandb"):
+                finish(exit_code=0)
+            else:
+                finish()
+
         def _finish_logger():
-            if hasattr(logger, "finish"):
-                logger.finish()
+            nonlocal logger_finished
+            if logger_finished:
+                return
+            logger_finished = True
+            try:
+                atexit.unregister(_finish_logger)
+            except Exception:
+                pass
+
+            finish = getattr(logger, "finish", None)
+            if callable(finish):
+                try:
+                    finish()
+                except BrokenPipeError:
+                    print("[WARN] Ignoring BrokenPipeError while finishing logger.")
+                finally:
+                    logger_backends = getattr(logger, "logger", None)
+                    if isinstance(logger_backends, dict):
+                        logger_backends.clear()
+                return
+
+            logger_backends = getattr(logger, "logger", {})
+            for backend_name, backend_logger in list(logger_backends.items()):
+                try:
+                    _finish_backend(backend_name, backend_logger)
+                except BrokenPipeError:
+                    print(f"[WARN] Ignoring BrokenPipeError while finishing {backend_name} logger.")
+                except Exception as exc:
+                    print(f"[WARN] Failed to finish {backend_name} logger cleanly: {exc}")
+                finally:
+                    logger_backends.pop(backend_name, None)
+
+        atexit.register(_finish_logger)
 
         self.global_steps = 0
 
@@ -1546,3 +1589,5 @@ class RayAgentTrainer(VerlRayPPOTrainer):
 
             progress_bar.update(1)
             self.global_steps += 1
+        _finish_logger()
+        progress_bar.close()
